@@ -1,0 +1,139 @@
+name: Promote Release (Reusable)
+
+# Central, customer-agnostic release-promotion workflow.
+#
+# When a release branch receives a push, this opens ONE pull request to the
+# next branch in that branch's family, advancing the cascade toward master.
+#
+# The trailing number is a single counter that only ever increments by 1 and
+# never resets. The version segment (e.g. 4.2.241) may change at the same time
+# (core-code updates bump it), so we do NOT guess the next branch name — we
+# DISCOVER the existing branch whose number is current+1 within the same family.
+#
+#   release_4.2.241_FSV_D63  ->  release_4.2.241_FSV_D64  -> ... -> master
+#   release_4.2.241_BNZ_21   ->  release_4.2.241_BNZ_22   -> ... -> master
+#   release_4.2.241_NS15     ->  release_4.2.251_NS16     -> ... -> master   (version bumped)
+#   release_4.2.241_D57      ->  release_4.2.251_D58      -> ... -> master   (core, version bumped)
+#
+# "Family" = the branch name with the version and the trailing number removed:
+#   release_4.2.241_FSV_D63 -> family "release__FSV_D"
+#   release_4.2.241_BNZ_21  -> family "release__BNZ_"
+#   release_4.2.241_NS15    -> family "release__NS"
+#   release_4.2.241_D57     -> family "release__D"
+# This keeps every customer (and core) in its own lane with zero config.
+#
+# Each hop is a separate, human-reviewed PR. A human merging one hop is a real
+# push that fires the caller workflow again, which opens the next hop. PRs are
+# created with the built-in GITHUB_TOKEN, which deliberately cannot trigger
+# further workflows — that is why merges are human, and it is what keeps the
+# cascade advancing one reviewed step at a time.
+
+on:
+  workflow_call:
+    inputs:
+      final_branch:
+        description: "Branch to target once no higher-numbered branch exists in the family"
+        required: false
+        default: "master"
+        type: string
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find next branch in the cascade
+        id: next
+        env:
+          SRC: ${{ github.ref_name }}
+          FINAL_BRANCH: ${{ inputs.final_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # --- helper: split "<front-ending-in-non-digit><trailing-number>" ---
+          # POSIX ERE (used by bash =~) has no non-greedy match, so we anchor the
+          # trailing digits with [0-9]+$ and force the front to end in a non-digit.
+          parse() {  # $1 = branch name; sets PARSE_STEM and PARSE_NUM, returns 1 if not a release branch
+            local b="$1" front
+            [[ "$b" =~ ^(.*[^0-9])([0-9]+)$ ]] || return 1
+            front="${BASH_REMATCH[1]}"
+            PARSE_NUM=$(( 10#${BASH_REMATCH[2]} ))
+            # Drop the 3-part version so branches differing only by version share a family.
+            [[ "$front" =~ ^(release_)[0-9]+\.[0-9]+\.[0-9]+(.*)$ ]] || return 1
+            PARSE_STEM="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+            return 0
+          }
+
+          if ! parse "$SRC"; then
+            echo "Branch '$SRC' is not a numbered release branch — nothing to promote. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          src_stem="$PARSE_STEM"
+          want_num=$(( PARSE_NUM + 1 ))
+          echo "Source '$SRC' -> family '$src_stem', number $PARSE_NUM, looking for number $want_num."
+
+          # Discover the existing branch in the same family whose number is current+1.
+          dest=""
+          while read -r _sha ref; do
+            b="${ref#refs/heads/}"
+            if parse "$b" && [[ "$PARSE_STEM" == "$src_stem" && "$PARSE_NUM" -eq "$want_num" ]]; then
+              dest="$b"
+              break
+            fi
+          done < <(git ls-remote --heads origin 'release_*')
+
+          if [[ -z "$dest" ]]; then
+            dest="$FINAL_BRANCH"
+            echo "No branch number $want_num in family '$src_stem' -> promoting to final branch '$FINAL_BRANCH'."
+          else
+            echo "Next branch is '$dest' -> promoting to it."
+          fi
+
+          if [[ "$dest" == "$SRC" ]]; then
+            echo "Source and destination are identical ('$SRC') — nothing to promote. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "dest=$dest" >> "$GITHUB_OUTPUT"
+
+      - name: Open promotion PR
+        if: steps.next.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SRC: ${{ github.ref_name }}
+          DEST: ${{ steps.next.outputs.dest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Nothing to promote if the destination already contains every commit from source.
+          if [[ -z "$(git rev-list "origin/$DEST..origin/$SRC" 2>/dev/null || echo HAS_DIFF)" ]]; then
+            echo "'$DEST' already contains everything in '$SRC'. Nothing to promote."
+            exit 0
+          fi
+
+          # Idempotent: if the PR for this exact hop is already open, leave it.
+          existing=$(gh pr list --state open --head "$SRC" --base "$DEST" --json number --jq '.[0].number' || true)
+          if [[ -n "${existing:-}" ]]; then
+            echo "PR #$existing already open for $SRC -> $DEST. Nothing to do."
+            exit 0
+          fi
+
+          gh pr create \
+            --head "$SRC" \
+            --base "$DEST" \
+            --title "Promote: $SRC → $DEST" \
+            --body "Auto-generated promotion PR from \`$SRC\` into \`$DEST\` as part of the release cascade.
+
+          Review and merge to advance the cascade toward \`${{ inputs.final_branch }}\`. Merging this PR triggers the next hop automatically."
